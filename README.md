@@ -85,6 +85,39 @@ python diarize.py -a AUDIO_FILE_NAME
 
 If your system has enough VRAM (>=10GB), you can use `diarize_parallel.py` instead, the difference is that it runs NeMo in parallel with Whisper, this can be beneficial in some cases and the result is the same since the two models are nondependent on each other. This is still experimental, so expect errors and sharp edges. Your feedback is welcome.
 
+### Bulk Processing
+
+For processing multiple audio files efficiently, use `bulk_diarize.py`. This script:
+- Reuses models across files (major performance optimization)
+- Uses the parallel pipeline from `diarize_parallel.py` for each file
+- Tracks detailed metrics (file size, step timings, total time)
+- Logs all metrics to a JSON file
+
+```bash
+# Process all audio files in a directory
+python bulk_diarize.py -d ./audio_files
+
+# Process recursively with custom options
+python bulk_diarize.py -d ./audio_files -r --whisper-model large-v2 --batch-size 4
+
+# Specify output directory and log file
+python bulk_diarize.py -d ./audio_files --output-dir ./outputs --log-file my_metrics.json
+```
+
+**Bulk Processing Options:**
+- `-d, --directory`: Directory containing audio files (default: current directory)
+- `-r, --recursive`: Search recursively in subdirectories
+- `--output-dir`: Output directory for results (default: same as input files)
+- `--log-file`: Path to metrics log file (default: `bulk_diarize_metrics.json`)
+- All other options from `diarize.py` are supported
+
+The metrics log file contains detailed information about each processed file including:
+- File size
+- Time for each pipeline step (source separation, transcription, diarization, alignment, etc.)
+- Total processing time per file
+- Success/failure status
+- Summary statistics
+
 ## Command Line Options
 
 - `-a AUDIO_FILE_NAME`: The name of the audio file to be processed
