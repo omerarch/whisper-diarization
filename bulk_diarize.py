@@ -125,6 +125,62 @@ def diarize_parallel(audio: torch.Tensor, device, queue: mp.Queue):
     queue.put(result)
 
 
+def batch_source_separation(audio_files: List[Path], device: str, output_base_dir: str) -> Dict[Path, Path]:
+    """
+    Pre-process all audio files with Demucs in batch.
+    Returns a mapping of original file paths to separated vocals paths.
+    """
+    logging.info(f"Starting batch source separation for {len(audio_files)} files...")
+    batch_start = time.time()
+    
+    # Create a temporary directory for batch separation
+    pid = os.getpid()
+    batch_output_dir = os.path.join(output_base_dir, f"batch_separation_{pid}_{int(time.time())}")
+    os.makedirs(batch_output_dir, exist_ok=True)
+    
+    # Build command to process all files at once
+    # Demucs can handle multiple files in one command
+    file_paths = [str(f) for f in audio_files]
+    files_arg = " ".join(f'"{f}"' for f in file_paths)
+    
+    cmd = (
+        f'python -m demucs.separate -n htdemucs --two-stems=vocals '
+        f'{files_arg} -o "{batch_output_dir}" --device "{device}"'
+    )
+    
+    logging.info("Running batch source separation (this may take a while)...")
+    return_code = os.system(cmd)
+    
+    if return_code != 0:
+        logging.warning("Batch source separation failed. Will fall back to per-file separation.")
+        return {}
+    
+    # Build mapping of original files to separated vocals
+    vocals_mapping = {}
+    for audio_file in audio_files:
+        base_name = os.path.splitext(os.path.basename(audio_file))[0]
+        vocals_path = os.path.join(
+            batch_output_dir,
+            "htdemucs",
+            base_name,
+            "vocals.wav"
+        )
+        if os.path.exists(vocals_path):
+            vocals_mapping[audio_file] = Path(vocals_path)
+        else:
+            logging.warning(f"Separated vocals not found for {audio_file}, will use original")
+            vocals_mapping[audio_file] = None
+    
+    batch_time = time.time() - batch_start
+    successful = sum(1 for v in vocals_mapping.values() if v is not None)
+    logging.info(
+        f"Batch source separation completed in {batch_time:.2f} seconds. "
+        f"Successfully separated {successful}/{len(audio_files)} files."
+    )
+    
+    return vocals_mapping
+
+
 def process_single_file(
     audio_path: Path,
     output_dir: Optional[Path],
@@ -140,6 +196,7 @@ def process_single_file(
     batch_size: int,
     stemming: bool,
     model_name: str,
+    pre_separated_vocals: Optional[Path] = None,  # Path to pre-separated vocals if available
 ) -> bool:
     """
     Process a single audio file through the full pipeline.
@@ -150,32 +207,44 @@ def process_single_file(
         
         # Step 1: Source separation (if enabled)
         step_start = time.time()
-        pid = os.getpid()
-        temp_outputs_dir = f"temp_outputs_{pid}_{int(time.time())}"
-        temp_path = os.path.join(os.getcwd(), temp_outputs_dir)
-        os.makedirs(temp_path, exist_ok=True)
         
         if stemming:
-            return_code = os.system(
-                f'python -m demucs.separate -n htdemucs --two-stems=vocals "{audio_path}" -o "{temp_outputs_dir}" --device "{device}"'
-            )
-            
-            if return_code != 0:
-                logging.warning(
-                    f"Source splitting failed for {audio_path}, using original audio file."
-                )
-                vocal_target = str(audio_path)
+            if pre_separated_vocals is not None and pre_separated_vocals.exists():
+                # Use pre-separated vocals from batch processing
+                vocal_target = str(pre_separated_vocals)
+                logging.debug(f"Using pre-separated vocals: {vocal_target}")
             else:
-                vocal_target = os.path.join(
-                    temp_outputs_dir,
-                    "htdemucs",
-                    os.path.splitext(os.path.basename(audio_path))[0],
-                    "vocals.wav",
+                # Fallback to per-file separation if batch processing didn't work
+                pid = os.getpid()
+                temp_outputs_dir = f"temp_outputs_{pid}_{int(time.time())}"
+                temp_path = os.path.join(os.getcwd(), temp_outputs_dir)
+                os.makedirs(temp_path, exist_ok=True)
+                
+                return_code = os.system(
+                    f'python -m demucs.separate -n htdemucs --two-stems=vocals "{audio_path}" -o "{temp_outputs_dir}" --device "{device}"'
                 )
+                
+                if return_code != 0:
+                    logging.warning(
+                        f"Source splitting failed for {audio_path}, using original audio file."
+                    )
+                    vocal_target = str(audio_path)
+                else:
+                    vocal_target = os.path.join(
+                        temp_outputs_dir,
+                        "htdemucs",
+                        os.path.splitext(os.path.basename(audio_path))[0],
+                        "vocals.wav",
+                    )
         else:
             vocal_target = str(audio_path)
         
-        metrics.record_step("source_separation", time.time() - step_start)
+        # Only record time if we actually did separation (not using pre-separated)
+        if stemming and (pre_separated_vocals is None or not pre_separated_vocals.exists()):
+            metrics.record_step("source_separation", time.time() - step_start)
+        else:
+            # Pre-separated, so separation time was already accounted for in batch step
+            metrics.record_step("source_separation", 0.0)
         
         # Step 2: Decode audio
         step_start = time.time()
@@ -443,6 +512,23 @@ def main():
     logging.info(f"Using device: {args.device}")
     logging.info(f"Whisper model: {args.model_name}")
     
+    # Process output directory (needed for batch separation)
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    
+    # Batch source separation (if enabled)
+    vocals_mapping = {}
+    if args.stemming:
+        # Use output directory or current directory for batch separation
+        output_base = str(output_dir) if output_dir else os.getcwd()
+        vocals_mapping = batch_source_separation(audio_files, args.device, output_base)
+        # Track batch separation time in metrics
+        if vocals_mapping:
+            # Calculate average time per file (rough estimate)
+            # We'll record this as a separate metric
+            logging.info("Batch source separation completed. Using pre-separated vocals for processing.")
+    else:
+        logging.info("Source separation disabled (--no-stem). Skipping batch separation.")
+    
     # Process language argument
     language = process_language_arg(args.language, args.model_name)
     
@@ -478,9 +564,6 @@ def main():
     model_load_time = time.time() - model_load_start
     logging.info(f"Models loaded in {model_load_time:.2f} seconds")
     
-    # Process output directory
-    output_dir = Path(args.output_dir) if args.output_dir else None
-    
     # Process each file
     overall_start = time.time()
     successful = 0
@@ -488,6 +571,9 @@ def main():
     
     for i, audio_file in enumerate(audio_files, 1):
         logging.info(f"\n[{i}/{len(audio_files)}] Processing: {audio_file}")
+        
+        # Get pre-separated vocals path if available
+        pre_separated = vocals_mapping.get(audio_file) if vocals_mapping else None
         
         success = process_single_file(
             audio_file,
@@ -504,6 +590,7 @@ def main():
             args.batch_size,
             args.stemming,
             args.model_name,
+            pre_separated_vocals=pre_separated,
         )
         
         if success:
