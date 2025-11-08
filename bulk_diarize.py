@@ -205,6 +205,9 @@ def process_single_file(
     try:
         metrics.start_file(str(audio_path))
         
+        # Initialize temp_path to None (only set if we do per-file separation)
+        temp_path = None
+        
         # Step 1: Source separation (if enabled)
         step_start = time.time()
         
@@ -379,8 +382,9 @@ def process_single_file(
         
         metrics.record_step("file_writing", time.time() - step_start)
         
-        # Cleanup
-        cleanup(temp_path)
+        # Cleanup (only if temp_path was created)
+        if temp_path is not None:
+            cleanup(temp_path)
         
         metrics.finish_file(success=True)
         return True
@@ -389,8 +393,8 @@ def process_single_file(
         error_msg = str(e)
         logging.error(f"Error processing {audio_path}: {error_msg}", exc_info=True)
         metrics.finish_file(success=False, error=error_msg)
-        # Cleanup on error
-        if 'temp_path' in locals():
+        # Cleanup on error (only if temp_path was created)
+        if temp_path is not None:
             try:
                 cleanup(temp_path)
             except:
